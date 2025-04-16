@@ -1,0 +1,252 @@
+/**
+ * @description Batch class to create junction records between Dentist and Practice Location Accounts
+ * Uses HealthcarePractitionerFacility as the junction object
+ * @author Optimized Version
+ * @date 2025-04-15
+ */
+public class DentistPracticeJunctionBatch implements Database.Batchable<SObject>, Database.Stateful {
+
+    // Class variables to store data between batch operations
+    private Map<Id, Set<String>> dentistToPracticeExternalIdsMap;
+    private Map<String, Id> practiceExternalIdToAccountIdMap;
+    private Set<String> allPracticeExternalIds;
+    private Set<Id> dentistContactIds;
+    
+    // Constants for reusable values
+    private static final String ERROR_SOURCE = 'DentistPracticeJunctionBatch';
+    
+    /**
+     * @description Constructor to initialize class variables
+     */
+    public DentistPracticeJunctionBatch() {
+        this.dentistToPracticeExternalIdsMap = new Map<Id, Set<String>>();
+        this.practiceExternalIdToAccountIdMap = new Map<String, Id>();
+        this.allPracticeExternalIds = new Set<String>();
+        this.dentistContactIds = new Set<Id>();
+    }
+
+    /**
+     * @description Start method for batch apex that queries for Dentist Accounts with practice relationships
+     * @param bc The batch context
+     * @return QueryLocator for dentist accounts requiring junction records
+     */
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        return Database.getQueryLocator([
+            SELECT Id, PersonContactId, Dentist_Practice_External_IDs__c, Relationship_Established__c
+            FROM Account
+            WHERE Dentist_Practice_External_IDs__c != null
+            AND Relationship_Established__c = false
+            AND RecordType.DeveloperName = 'Dentist'
+            AND PersonContactId != null
+        ]);
+    }
+
+    /**
+     * @description Execute method processes each batch of dentist accounts
+     * @param bc The batch context
+     * @param dentistAccounts List of dentist accounts to process
+     */
+    public void execute(Database.BatchableContext bc, List<Account> dentistAccounts) {
+        try {
+            processDentistAccounts(dentistAccounts);
+            queryPracticeAccounts();
+            createJunctionRecords(dentistAccounts);
+        } catch (Exception e) {
+            System.debug('Error in execute method : ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+        }
+    }
+
+    /**
+     * @description Finish method called after all batches are processed
+     * @param bc The batch context
+     */
+    public void finish(Database.BatchableContext bc) {
+        // Optional post-processing logic
+    }
+
+    /**
+     * @description Processes dentist accounts and extracts practice external IDs
+     * @param dentistAccounts List of dentist accounts to process
+     */
+    private void processDentistAccounts(List<Account> dentistAccounts) {
+		try{
+			// Clear maps to prevent data from previous batches affecting the current one
+			dentistToPracticeExternalIdsMap.clear();
+			allPracticeExternalIds.clear();
+			dentistContactIds.clear();
+
+			for (Account dentist : dentistAccounts) {
+				if (String.isNotBlank(dentist.Dentist_Practice_External_IDs__c)) {
+					// Split and store unique practice external IDs for each dentist
+					List<String> practiceExternalIds = dentist.Dentist_Practice_External_IDs__c.split(';');
+					Set<String> uniquePracticeExternalIds = new Set<String>(practiceExternalIds);
+					
+					dentistToPracticeExternalIdsMap.put(dentist.Id, uniquePracticeExternalIds);
+					allPracticeExternalIds.addAll(uniquePracticeExternalIds);
+					
+					// Store PersonContactId for later querying
+					if (dentist.PersonContactId != null) {
+						dentistContactIds.add(dentist.PersonContactId);
+					}
+				}
+			}
+		}catch (Exception e){
+                System.debug('Error in processDentistAccounts : ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+        }
+    }
+
+    /**
+     * @description Queries for practice accounts based on external IDs
+     */
+    private void queryPracticeAccounts() {
+        // Clear map to prevent stale data
+        practiceExternalIdToAccountIdMap.clear();
+        
+        if (!allPracticeExternalIds.isEmpty()) {
+            try {
+                for (Account practice : [
+                    SELECT Id, Snowflake_External_Id__c
+                    FROM Account
+                    WHERE ( RecordType.DeveloperName = 'DSO' OR RecordType.DeveloperName = 'Subsidiary' OR RecordType.DeveloperName = 'DentistPractice')
+                    AND Snowflake_External_Id__c IN :allPracticeExternalIds
+                ]) {
+                    practiceExternalIdToAccountIdMap.put(practice.Snowflake_External_Id__c, practice.Id);
+                }
+            } catch (Exception e) {
+                System.debug('Error in queryPracticeAccounts : ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+            }
+        }
+    }
+
+    /**
+     * @description Creates junction records between dentists and practices
+     * @param dentistAccounts List of dentist accounts being processed
+     */
+    private void createJunctionRecords(List<Account> dentistAccounts) {
+        List<HealthcarePractitionerFacility> junctionsToInsert = new List<HealthcarePractitionerFacility>();
+        List<Account> dentistsToUpdate = new List<Account>();
+
+        try {
+            // Query existing junctions to avoid duplicates
+            Map<String, HealthcarePractitionerFacility> existingJunctionsMap = queryExistingJunctions();
+
+            for (Account dentist : dentistAccounts) {
+                Set<String> practiceExternalIds = dentistToPracticeExternalIdsMap.get(dentist.Id);
+                Boolean allPracticesFound = true;
+
+                if (practiceExternalIds != null && !practiceExternalIds.isEmpty()) {
+                    for (String practiceExternalId : practiceExternalIds) {
+                        Id practiceAccountId = practiceExternalIdToAccountIdMap.get(practiceExternalId);
+
+                        if (practiceAccountId != null) {
+                            // Create a unique key to check for existing junctions
+                            String junctionKey = dentist.PersonContactId + '-' + practiceAccountId;
+
+                            if (!existingJunctionsMap.containsKey(junctionKey)) {
+                                HealthcarePractitionerFacility junction = new HealthcarePractitionerFacility(
+                                    AccountId = practiceAccountId,
+                                    PractitionerId = dentist.PersonContactId,
+                                    IsActive = true
+                                );
+                                junctionsToInsert.add(junction);
+                            }
+                        } else {
+                            // Mark that not all practices were found
+                            allPracticesFound = false;
+                        }
+                    }
+
+                    // Only mark relationship as established if all practices were found
+                    if (allPracticesFound) {
+                        dentistsToUpdate.add(new Account(
+                            Id = dentist.Id,
+                            Relationship_Established__c = true
+                        ));
+                    }
+                }
+            }
+
+            // Insert junctions in bulk
+            if (!junctionsToInsert.isEmpty()) {
+                Database.SaveResult[] junctionInsertResults = Database.insert(junctionsToInsert, false);
+                processOperationResults(junctionInsertResults, 'Junction Insert', junctionsToInsert);
+            }
+
+            // Update dentists in bulk
+            if (!dentistsToUpdate.isEmpty()) {
+                Database.SaveResult[] dentistUpdateResults = Database.update(dentistsToUpdate, false);
+                processOperationResults(dentistUpdateResults, 'Dentist Account Update', dentistsToUpdate);
+            }
+        } catch (Exception e) {
+            System.debug('Error in createJunctionRecords : ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+        }
+    }
+
+    /**
+     * @description Queries for existing junction records to prevent duplicates
+     * @return Map of existing junction records keyed by PractitionerId-AccountId
+     */
+    private Map<String, HealthcarePractitionerFacility> queryExistingJunctions() {
+        Map<String, HealthcarePractitionerFacility> existingJunctionsMap = new Map<String, HealthcarePractitionerFacility>();
+        
+        try {
+            // Get all practice account IDs from our map of external IDs
+            Set<Id> practiceAccountIds = new Set<Id>(practiceExternalIdToAccountIdMap.values());
+            
+            // Only query if we have both dentist contacts and practice accounts
+            if (!dentistContactIds.isEmpty() && !practiceAccountIds.isEmpty()) {
+                for (HealthcarePractitionerFacility junction : [
+                    SELECT Id, AccountId, PractitionerId
+                    FROM HealthcarePractitionerFacility
+                    WHERE PractitionerId IN :dentistContactIds
+                    AND AccountId IN :practiceAccountIds
+                ]) {
+                    String junctionKey = junction.PractitionerId + '-' + junction.AccountId;
+                    existingJunctionsMap.put(junctionKey, junction);
+                }
+            }
+        } catch (Exception e) {
+			System.debug('Error in queryExistingJunctions : ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+        }
+        return existingJunctionsMap;
+    }
+    
+    /**
+	* @description Process database operation results and log errors
+	* @param results List of database operation results
+	* @param operationType String describing the operation type
+	* @param sourceRecords List of records that were operated on
+	*/
+	private void processOperationResults(Database.SaveResult[] results, String operationType, List<SObject> sourceRecords) {
+		List<Error_Log__c> errorLogs = new List<Error_Log__c>();
+		
+		for (Integer i = 0; i < results.size(); i++) {
+			if (!results[i].isSuccess()) {
+				SObject record = sourceRecords[i];
+				String recordInfo = 'Id: ' + (record.Id != null ? record.Id : 'New Record');
+				String errorMessages = '';
+				
+				for (Database.Error error : results[i].getErrors()) {
+					errorMessages += error.getMessage() + '; ';
+				}
+				
+				Error_Log__c errorLog = new Error_Log__c(
+					Operation__c = operationType,
+					Message__c = errorMessages,
+					Error_Code__c = String.valueOf(results[i].getErrors()[0].getStatusCode()),
+					Stack_Trace__c = recordInfo
+				);
+				
+				errorLogs.add(errorLog);
+			}
+		}
+		
+		if (!errorLogs.isEmpty()) {
+			try {
+				insert errorLogs;
+			} catch (Exception e) {
+				System.debug('Failed to insert error logs: ' + e.getMessage() + ' at line ' + e.getLineNumber());
+			}
+		}
+	}
+}

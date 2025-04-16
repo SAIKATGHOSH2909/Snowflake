@@ -1,0 +1,492 @@
+/**
+* @File Name : SnowflakeIntegrationUtility.cls
+* @Description : Utility class for integrating Snowflake data with Salesforce, with enhanced validation and error handling
+*                Refactored to implement bulk patterns and avoid SOQL in loops
+* @Last Modified On : April 14, 2025
+* @Modification Log :
+*==============================================================================
+* Ver | Date | Author | Modification
+*==============================================================================
+* 1.0 | April 14, 2025 |   | Initial Version
+* 1.1 | April 14, 2025 |   | Refactored to implement bulk patterns and avoid SOQL in loops
+* 1.2 | April 14, 2025 |   | Added special handling for Dentist records with duplicate NPIs to consolidate practice location IDs
+**/
+
+public with sharing class SnowflakeIntegrationUtility {
+
+    // Static constants for recordtype IDs
+    private static final Id SNOWFLAKE_ERROR_RECORDTYPE_ID = Error_Log__c.SObjectType.getDescribe().getRecordTypeInfosByDeveloperName().get('SnowflakeError').getRecordTypeId();
+    private static final SObjectField SNOWFLAKE_EXTERNAL_ID = Account.SObjectType.getDescribe().fields.getMap().get('Snowflake_External_Id__c');
+    private static final SObjectField NPI_EXTERNAL_ID = Account.SObjectType.getDescribe().fields.getMap().get('NPI_Number__c');
+
+    private static final String DENTIST = 'Dentist';
+    private static final String PRACTICE_LOCATION_ID = 'PRACTICE_LOCATION_ID';
+    private static final String RELATIONSHIP_ESTABLISHED = 'Relationship_Established__c';
+    private static final String DENTIST_PRACTICE_EXTERNAL_IDS = 'Dentist_Practice_External_IDs__c';
+    private static final String FIELD_VALIDATION_LOGS = 'Field_Validation_Logs__c';
+    private static final String ALTERNATE_EMAIL_ADDRESS = 'Alternate_Email_Address__c';
+    private static final String PERSONEMAIL = 'PersonEmail';
+    
+    // Email validation pattern
+    private static final Pattern EMAIL_PATTERN = Pattern.compile('^[a-zA-Z0-9._|\\\\%#~`=?&/$^*!}{+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,4}$');
+
+    /**
+    * Log errors from upsert operations with raw data
+    * @param results The upsert results
+    * @param operation The operation being performed
+    * @param dataRows The raw data rows being processed (for logging)
+    * @param partitionInfo Information about the current partition for logging
+    **/
+    private static void logUpsertErrors(Database.UpsertResult[] results, String operation, List<String> dataRowsForLogging, String partitionInfo) {
+        try {
+            if (results == null || dataRowsForLogging == null) return;
+            List<Error_Log__c> errorLogs = new List<Error_Log__c>();
+            for (Integer i = 0; i < results.size(); i++) {
+                Database.UpsertResult res = results[i];
+                if (!res.isSuccess()) {
+                    String dataRowJson = i < dataRowsForLogging.size() ? dataRowsForLogging[i] : 'Data row not available';
+                    for (Database.Error err : res.getErrors()) {
+                        Error_Log__c log = new Error_Log__c(
+                            RecordTypeId = SNOWFLAKE_ERROR_RECORDTYPE_ID,
+                            Operation__c = operation,
+                            Record_Id__c = res.getId(),
+                            Message__c = err.getMessage(),
+                            Error_Code__c = String.valueOf(err.getStatusCode()),
+                            Stack_Trace__c = String.join(err.getFields(), ', '),
+                            Data_Row_Json__c = dataRowJson,
+                            Partition_Number__c = partitionInfo
+                        );
+                        errorLogs.add(log);
+                    }
+                }
+            }
+            // Insert error logs if there are any
+            if (!errorLogs.isEmpty()) {
+                insert errorLogs;
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Error in logUpsertErrors: ' + e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+        }
+    }
+
+    /**
+    * Process generic account data from Snowflake
+    * @param dataChunk List of data rows to process
+    * @param columnNames List of column names corresponding to the data positions
+    * @param partitionInfo Information about the current partition for logging
+    * @param accountType Type of account to process (ParentCompany, Subsidiary, Practice)
+    **/
+    public static void processGenericAccountData(List<Object> dataChunk, List<String> columnNames, String partitionInfo, String accountType) {
+        try {
+            // Get field mappings for this account type
+            Map<String, String> fieldMappings = getFieldMappingsForAccountType(accountType);
+            if (fieldMappings.isEmpty()) {
+                System.debug(LoggingLevel.ERROR, 'No field mappings found for account type: ' + accountType);
+                return;
+            }
+            
+            // Get the appropriate record type ID for this account type
+            Id accRecordTypeId = Account.SObjectType.getDescribe().getRecordTypeInfosByDeveloperName().get(accountType).getRecordTypeId();
+            
+            // Get the external ID field name for this account type
+            String externalIdFieldName;
+            if (accountType == DENTIST) {
+                externalIdFieldName = NPI_EXTERNAL_ID.getDescribe().getName();
+            } else {
+                externalIdFieldName = SNOWFLAKE_EXTERNAL_ID.getDescribe().getName();
+            }
+            
+            List<Account> accountsToUpsert = new List<Account>();
+            List<String> dataRowsForLogging = new List<String>();
+            List<Error_Log__c> dataErrorLogs = new List<Error_Log__c>();
+            
+            // Special handling for Dentist records to consolidate duplicate NPIs
+            if (accountType == DENTIST) {
+                // Maps to track practice locations by NPI and create one consolidated record per NPI
+                Map<String, Set<String>> npiToPracticeLocations = new Map<String, Set<String>>();
+                Map<String, Map<String, Object>> npiToRowData = new Map<String, Map<String, Object>>();
+                Set<String> uniqueNPIs = new Set<String>();
+                
+                // First pass: collect all NPIs and practice locations
+                for (Object row : dataChunk) {
+                    try {
+                        List<Object> dataRow = (List<Object>) row;
+                        if (dataRow != null && !dataRow.isEmpty()) {
+                            // Convert row data to a map for easier access
+                            Map<String, Object> rowData = new Map<String, Object>();
+                            for (Integer i = 0; i < columnNames.size() && i < dataRow.size(); i++) {
+                                if (columnNames[i] != null) {
+                                    rowData.put(columnNames[i].toUpperCase(), dataRow[i]);
+                                }
+                            }
+                            
+                            // Get NPI and practice location ID
+                            String npi = getFieldValue(rowData, fieldMappings, externalIdFieldName);
+                            String practiceLocationId = rowData.containsKey(PRACTICE_LOCATION_ID) && rowData.get(PRACTICE_LOCATION_ID) != null ? 
+                                String.valueOf(rowData.get(PRACTICE_LOCATION_ID)).trim() : '';
+                            
+                            if (String.isNotBlank(npi)) {
+                                uniqueNPIs.add(npi);
+                                
+                                // Store the first row data for this NPI if we haven't seen it yet
+                                if (!npiToRowData.containsKey(npi)) {
+                                    npiToRowData.put(npi, rowData);
+                                }
+                                
+                                // Add practice location ID to the set for this NPI
+                                if (String.isNotBlank(practiceLocationId)) {
+                                    if (!npiToPracticeLocations.containsKey(npi)) {
+                                        npiToPracticeLocations.put(npi, new Set<String>());
+                                    }
+                                    npiToPracticeLocations.get(npi).add(practiceLocationId);
+                                }
+                            } else {
+                                // Log records with missing NPIs
+                                dataErrorLogs.add(new Error_Log__c(
+                                    RecordTypeId = SNOWFLAKE_ERROR_RECORDTYPE_ID,
+                                    Operation__c = accountType + ' - Missing External ID',
+                                    Message__c = 'Record skipped due to missing NPI',
+                                    Data_Row_Json__c = JSON.serialize(rowData),
+                                    Partition_Number__c = partitionInfo
+                                ));
+                            }
+                        }
+                    } catch (Exception rowEx) {
+                        // Log any exceptions during row processing
+                        String errorMsg = 'Error processing ' + accountType + ' row: ' + rowEx.getMessage();
+                        String rowJson = JSON.serialize(row);
+                        
+                        dataErrorLogs.add(new Error_Log__c(
+                            RecordTypeId = SNOWFLAKE_ERROR_RECORDTYPE_ID,
+                            Operation__c = accountType + ' - Row Processing Error',
+                            Message__c = errorMsg,
+                            Data_Row_Json__c = rowJson,
+                            Partition_Number__c = partitionInfo
+                        ));
+                    }
+                }
+                
+                // Query existing practice location IDs for these NPIs
+                Map<String, String> existingPracticeIds = new Map<String, String>();
+                if (!uniqueNPIs.isEmpty()) {
+                    for (Account acc : [SELECT Id, NPI_Number__c, Dentist_Practice_External_IDs__c 
+                                       FROM Account 
+                                       WHERE NPI_Number__c IN :uniqueNPIs 
+                                       AND RecordTypeId = :accRecordTypeId]) {
+                        if (String.isNotBlank(acc.Dentist_Practice_External_IDs__c)) {
+                            existingPracticeIds.put(acc.NPI_Number__c, acc.Dentist_Practice_External_IDs__c);
+                        }
+                    }
+                }
+                
+                // Create one consolidated account per unique NPI
+                for (String npi : uniqueNPIs) {
+                    Account acc = new Account(RecordTypeId = accRecordTypeId);
+                    acc.put(externalIdFieldName, npi);
+                    
+                    // Populate account fields from stored row data
+                    if (npiToRowData.containsKey(npi)) {
+                        acc.put(RELATIONSHIP_ESTABLISHED, false);
+                        populateAccountFields(acc, npiToRowData.get(npi), fieldMappings);
+                        validateAccountData(acc, npiToRowData.get(npi), fieldMappings);
+                    }
+                    
+                    // Consolidate practice location IDs (both new and existing)
+                    Set<String> allPracticeLocations = new Set<String>();
+                    
+                    // Add existing practice locations
+                    if (existingPracticeIds.containsKey(npi)) {
+                        String existingLocations = existingPracticeIds.get(npi);
+                        for (String loc : existingLocations.split(';')) {
+                            if (String.isNotBlank(loc)) {
+                                allPracticeLocations.add(loc.trim());
+                            }
+                        }
+                    }
+                    
+                    // Add new practice locations
+                    if (npiToPracticeLocations.containsKey(npi)) {
+                        allPracticeLocations.addAll(npiToPracticeLocations.get(npi));
+                    }
+                    
+                    // Set the consolidated practice location IDs
+                    if (!allPracticeLocations.isEmpty()) {
+                        List<String> locationsList = new List<String>(allPracticeLocations);
+                        acc.put(DENTIST_PRACTICE_EXTERNAL_IDS, String.join(locationsList, ';'));
+                    }
+                    
+                    accountsToUpsert.add(acc);
+                    dataRowsForLogging.add(JSON.serialize(npiToRowData.get(npi)));
+                }
+            }
+            // Standard processing for non-Dentist account types
+            else {
+                for (Object row : dataChunk) {
+                    try {
+                        List<Object> dataRow = (List<Object>) row;
+                        if (dataRow != null && !dataRow.isEmpty()) {
+                        
+                            // Convert row data to a map for easier access
+                            Map<String, Object> rowData = new Map<String, Object>();
+                            for (Integer i = 0; i < columnNames.size() && i < dataRow.size(); i++) {
+                                if (columnNames[i] != null) {
+                                    rowData.put(columnNames[i].toUpperCase(), dataRow[i]);
+                                }
+                            }
+
+                            // Store raw data for logging
+                            String rawDataJson = JSON.serialize(rowData);
+                            
+                            // Check for required external ID value
+                            String externalIdValue = getFieldValue(rowData, fieldMappings, externalIdFieldName);
+                            if (String.isBlank(externalIdValue)) {
+                                // Log records with missing external IDs
+                                dataErrorLogs.add(new Error_Log__c(
+                                    RecordTypeId = SNOWFLAKE_ERROR_RECORDTYPE_ID,
+                                    Operation__c = accountType + ' - Missing External ID',
+                                    Message__c = 'Record skipped due to missing external ID',
+                                    Data_Row_Json__c = rawDataJson,
+                                    Partition_Number__c = partitionInfo
+                                ));
+                            } else {
+                                // Create and populate the account
+                                Account acc = new Account(RecordTypeId = accRecordTypeId);
+                                acc.put(RELATIONSHIP_ESTABLISHED, false);
+                                // Map all other fields based on metadata mappings
+                                populateAccountFields(acc, rowData, fieldMappings);
+                                validateAccountData(acc, rowData, fieldMappings);
+                                accountsToUpsert.add(acc);
+                                dataRowsForLogging.add(rawDataJson);
+                            }
+                        }
+                    } catch (Exception rowEx) {
+                        // Log any exceptions during row processing
+                        String errorMsg = 'Error processing ' + accountType + ' row: ' + rowEx.getMessage();
+                        String rowJson = JSON.serialize(row);
+                        
+                        dataErrorLogs.add(new Error_Log__c(
+                            RecordTypeId = SNOWFLAKE_ERROR_RECORDTYPE_ID,
+                            Operation__c = accountType + ' - Row Processing Error',
+                            Message__c = errorMsg,
+                            Data_Row_Json__c = rowJson,
+                            Partition_Number__c = partitionInfo
+                        ));
+                    }
+                }
+            }
+            
+            // Insert data error logs in bulk if there are any
+            if (!dataErrorLogs.isEmpty()) {
+                insert dataErrorLogs;
+            }
+            
+            if (!accountsToUpsert.isEmpty()) {
+                // Perform upsert operation
+                if (accountType == DENTIST) {
+                    Database.UpsertResult[] results = Database.upsert(accountsToUpsert, NPI_EXTERNAL_ID, false);
+                    logUpsertErrors(results, accountType + ' upsert', dataRowsForLogging, partitionInfo);
+                } else {
+                    Database.UpsertResult[] results = Database.upsert(accountsToUpsert, SNOWFLAKE_EXTERNAL_ID, false);
+                    logUpsertErrors(results, accountType + ' upsert', dataRowsForLogging, partitionInfo);
+                }
+            } else {
+                System.debug(LoggingLevel.INFO, 'No valid ' + accountType + ' records found to upsert in partition: ' + partitionInfo);
+            }
+        } catch (Exception e) {            
+            System.debug(LoggingLevel.ERROR, 'Error in processGenericAccountData for ' + accountType + ': ' + 
+                        e.getMessage() + ' at line ' + e.getLineNumber() + ' Stack trace: ' + e.getStackTraceString());
+            throw new SnowflakeIntegrationException('Error processing ' + accountType + ' data: ' + e.getMessage());
+        }
+    }
+
+    /**
+    * Get field mappings from custom metadata for the specified account type
+    * @param accountType The type of account (ParentCompany, Subsidiary, Practice)
+    * @return Map of Salesforce field API names to Snowflake column names
+    */
+    private static Map<String, String> getFieldMappingsForAccountType(String accountType) {
+        Map<String, String> fieldMappings = new Map<String, String>();
+        
+        // Query for field mappings from custom metadata
+        List<Snowflake_Field_Mapping__mdt> mappings = [
+            SELECT Salesforce_Field__c, Snowflake_Field__c, Account_RecordType__c, Active__c 
+            FROM Snowflake_Field_Mapping__mdt
+            WHERE Account_RecordType__c = :accountType AND Active__c = true
+        ];
+        
+        for (Snowflake_Field_Mapping__mdt mapping : mappings) {
+            fieldMappings.put(mapping.Salesforce_Field__c, mapping.Snowflake_Field__c);
+        }
+        
+        return fieldMappings;
+    }
+
+    /**
+    * Get the value for a Salesforce field from Snowflake data using field mappings
+    * @param rowData The Snowflake row data
+    * @param fieldMappings Map of Salesforce field to Snowflake field
+    * @param salesforceField The Salesforce field API name
+    * @return The value for the field
+    */
+    private static String getFieldValue(Map<String, Object> rowData, Map<String, String> fieldMappings, String salesforceField) {
+        String snowflakeField = fieldMappings.get(salesforceField);
+        if (String.isBlank(snowflakeField)) return '';
+        
+        return rowData.containsKey(snowflakeField.toUpperCase()) && rowData.get(snowflakeField.toUpperCase()) != null ? 
+            String.valueOf(rowData.get(snowflakeField.toUpperCase())).trim() : '';
+    }
+
+    /**
+    * Populate account fields based on field mappings
+    * @param acc The account to populate
+    * @param rowData The Snowflake row data
+    * @param fieldMappings Map of Salesforce field to Snowflake field
+    */
+
+    private static void populateAccountFields(Account acc, Map<String, Object> rowData, Map<String, String> fieldMappings) {
+    // Get a map of all Account fields and their types
+    Map<String, Schema.SObjectField> accountFieldMap = Schema.SObjectType.Account.fields.getMap();
+    
+        for (String salesforceField : fieldMappings.keySet()) {
+            // Skip Dentist_Practice_External_IDs__c as it's handled specially for Dentist accounts
+            if (salesforceField == DENTIST_PRACTICE_EXTERNAL_IDS) continue;
+            
+            String snowflakeField = fieldMappings.get(salesforceField);
+            if (snowflakeField != null) {
+                String snowflakeFieldUpper = snowflakeField.toUpperCase();
+                
+                // Handle special case for concatenated addresses
+                if (snowflakeFieldUpper.contains('+')) {
+                    // This is a concatenated field like "PARENT_ADDRESS1+PARENT_ADDRESS2"
+                    List<String> fieldParts = snowflakeFieldUpper.split('\\+');
+                    List<String> addressParts = new List<String>();
+                    
+                    for (String part : fieldParts) {
+                        String value = rowData.containsKey(part) && rowData.get(part) != null ? 
+                                    String.valueOf(rowData.get(part)).trim() : '';
+                        if (String.isNotBlank(value)) {
+                            addressParts.add(value);
+                        }
+                    }
+                    
+                    // Set the combined field value
+                    if (!addressParts.isEmpty()) {
+                        acc.put(salesforceField, String.join(addressParts, ' '));
+                    }
+                }
+                // Special handling for PersonGender field
+                else if (salesforceField == 'PersonGender') {
+                    if (rowData.containsKey(snowflakeFieldUpper) && rowData.get(snowflakeFieldUpper) != null) {
+                        String genderCode = String.valueOf(rowData.get(snowflakeFieldUpper)).trim();
+                        
+                        // Map gender codes to full values
+                        if (genderCode == 'M') {
+                            acc.put(salesforceField, 'Male');
+                        } else if (genderCode == 'F') {
+                            acc.put(salesforceField, 'Female');
+                        } else {
+                            acc.put(salesforceField, 'Other');
+                        }
+                    }
+                }
+                // Standard field mapping (non-concatenated)
+                else if (rowData.containsKey(snowflakeFieldUpper) && rowData.get(snowflakeFieldUpper) != null) {
+                    // Get the Salesforce field type
+                    Schema.SObjectField field = accountFieldMap.get(salesforceField);
+                    if (field != null) {
+                        Schema.DisplayType fieldType = field.getDescribe().getType();
+                        
+                        // Handle different field types appropriately
+                        String stringValue = String.valueOf(rowData.get(snowflakeFieldUpper)).trim();
+                        
+                        if (String.isNotBlank(stringValue)) {
+                            try {
+                                // For numeric fields, convert string to appropriate numeric type
+                                if (fieldType == Schema.DisplayType.CURRENCY || 
+                                    fieldType == Schema.DisplayType.DOUBLE || 
+                                    fieldType == Schema.DisplayType.PERCENT ) {
+                                    acc.put(salesforceField, Decimal.valueOf(stringValue));
+                                } 
+                                // For integer fields
+                                else if (fieldType == Schema.DisplayType.INTEGER) {
+                                    acc.put(salesforceField, Integer.valueOf(stringValue));
+                                }
+                                // For boolean fields
+                                else if (fieldType == Schema.DisplayType.BOOLEAN) {
+                                    acc.put(salesforceField, Boolean.valueOf(stringValue));
+                                }
+                                // For date fields
+                                else if (fieldType == Schema.DisplayType.DATE) {
+                                    acc.put(salesforceField, Date.valueOf(stringValue));
+                                }
+                                // For datetime fields
+                                else if (fieldType == Schema.DisplayType.DATETIME) {
+                                    acc.put(salesforceField, Datetime.valueOf(stringValue));
+                                }
+                                // For all other types (string, text, etc.)
+                                else {
+                                    acc.put(salesforceField, stringValue);
+                                }
+                            } catch (Exception e) {
+                                // If conversion fails, log it but don't throw an exception to allow processing to continue
+                                System.debug(LoggingLevel.ERROR, 'Error converting field ' + salesforceField + 
+                                            ' with value: ' + stringValue + '. Error: ' + e.getMessage());
+                            }
+                        }
+                    } else {
+                        // If field isn't found in the schema (custom field not in this org, etc.)
+                        // Just use string value as fallback
+                        acc.put(salesforceField, String.valueOf(rowData.get(snowflakeFieldUpper)).trim());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+    * Validate account data and add validation logs if necessary
+    * @param acc The account to validate
+    * @param rowData The Snowflake row data
+    * @param fieldMappings Map of Salesforce field to Snowflake field
+    */
+    private static void validateAccountData(Account acc, Map<String, Object> rowData, Map<String, String> fieldMappings) {
+        List<String> validationIssues = new List<String>();
+        
+        // Validate email if present
+        if (fieldMappings.containsKey(PERSONEMAIL) || fieldMappings.containsKey(ALTERNATE_EMAIL_ADDRESS)) {
+            String emailField;
+            if(fieldMappings.containsKey(PERSONEMAIL)){
+                emailField = fieldMappings.get(PERSONEMAIL).toUpperCase();
+            }else if(fieldMappings.containsKey(ALTERNATE_EMAIL_ADDRESS)){
+                emailField = fieldMappings.get(ALTERNATE_EMAIL_ADDRESS).toUpperCase();
+            }
+            String email = rowData.containsKey(emailField) && rowData.get(emailField) != null ? 
+                        String.valueOf(rowData.get(emailField)).trim() : '';
+            
+            if (String.isNotBlank(email) && !isValidEmail(email)) {
+                validationIssues.add('email - ' + email);
+            }
+        }
+        
+        // Add validation issues to account if any found
+        if (!validationIssues.isEmpty()) {
+            acc.put(FIELD_VALIDATION_LOGS, String.join(validationIssues, ', '));
+        }
+    }
+
+    /**
+    * Validate email using regex
+    * @param email Email address to validate
+    * @return Whether the email is valid
+    */
+    private static Boolean isValidEmail(String email) {
+        if (String.isBlank(email)) return false;
+        Matcher matcher = EMAIL_PATTERN.matcher(email);
+        return matcher.matches();
+    }
+    
+    /**
+    * Custom exception class for Snowflake integration errors
+    */
+    public class SnowflakeIntegrationException extends Exception {}
+}

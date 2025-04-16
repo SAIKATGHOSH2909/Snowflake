@@ -1,0 +1,150 @@
+/**
+* @File Name : SnowflakeMainBatch.cls
+* @Description :
+* @Author :
+* @Last Modified By :
+* @Last Modified On : April 14, 2025
+* @Modification Log :
+*==============================================================================
+* Ver | Date | Author | Modification
+*==============================================================================
+* 1.0 | April 14, 2025 |   | Initial Version
+**/
+
+public class SnowflakeMainBatch implements Database.Batchable<Integer>, Database.AllowsCallouts, Database.Stateful {
+    
+    private String startDate;
+    private String endDate;
+	private String procedureName;
+    private String statementHandle;
+    private Integer partitionCount;
+    private List<String> columnNames;
+    private Integer currentPartitionIndex = 0;
+    private List<Integer> allPartitions;
+    
+    // Constructor for initial batch execution with date range
+    public SnowflakeMainBatch(String startDate, String endDate,String procedureName) {
+        this.startDate = startDate;
+        this.endDate = endDate;
+		this.procedureName = procedureName;//'GET_PRACTICE_LOCATION_PARENT_COMPANY'
+    }
+    
+    // Constructor for chained batch execution
+    public SnowflakeMainBatch(String startDate, String endDate, String statementHandle, 
+                                      List<String> columnNames, Integer partitionCount, 
+                                      List<Integer> allPartitions, Integer currentPartitionIndex,String procedureName) {
+        this.startDate = startDate;
+        this.endDate = endDate;
+        this.statementHandle = statementHandle;
+        this.columnNames = columnNames;
+        this.partitionCount = partitionCount;
+        this.allPartitions = allPartitions;
+        this.currentPartitionIndex = currentPartitionIndex;
+		this.procedureName = procedureName;
+    }
+
+    public Iterable<Integer> start(Database.BatchableContext bc) {
+        System.debug('Start Method of SnowflakeMainBatch');
+        
+        // Only make the initial API call if this is the first batch in the chain
+        if (statementHandle == null) {
+            try {
+                // Call Snowflake API with date range parameters
+                HttpResponse response = SnowflakeIntegration.callSnowflakeAPIWithDateRange(procedureName,startDate, endDate);
+                //System.debug('Status Code -'+response.getStatusCode());
+				if (response.getStatusCode() == 200) {
+                    String responseBody = response.getBody();
+                    Map<String, Object> responseMap = (Map<String, Object>) JSON.deserializeUntyped(responseBody);
+                    
+                    if (responseMap.containsKey('resultSetMetaData')) {
+                        Map<String, Object> metaData = (Map<String, Object>) responseMap.get('resultSetMetaData');
+                        this.columnNames = SnowflakeIntegration.extractColumnNames(metaData);
+                        
+                        if (metaData.containsKey('partitionInfo')) {
+                            List<Object> partitionInfoList = (List<Object>) metaData.get('partitionInfo');
+                            this.partitionCount = partitionInfoList.size();
+                            
+                            if (responseMap.containsKey('statementHandle')) {
+                                this.statementHandle = (String) responseMap.get('statementHandle');
+                                
+                                // Prepare list of all partitions to process
+                                this.allPartitions = new List<Integer>();
+                                for (Integer i = 0; i < this.partitionCount; i++) {
+                                    this.allPartitions.add(i);
+                                }
+                                System.debug('statementHandle -'+this.statementHandle);
+								System.debug('Total Partition -'+this.allPartitions.size());
+                                // Return just the first partition to process
+                                return new List<Integer>{ this.allPartitions[0] };
+                            }
+                        }
+                    }
+                } else {
+                    throw new SnowflakeIntegration.SnowflakeIntegrationException(
+                        'Initial Snowflake API call failed with status code: ' + response.getStatusCode());
+                }
+            } catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'Snowflake Parent Company Integration Initial API Call Failed: ' + 
+                            e.getMessage() + ' - Stack: ' + e.getStackTraceString());
+            }
+            return new List<Integer>();
+        }
+        
+        // For subsequent batches, return the next partition to process
+        return new List<Integer>{ this.allPartitions[this.currentPartitionIndex] };
+    }
+
+    public void execute(Database.BatchableContext bc, List<Integer> scope) {
+        System.debug('Execute Method of SnowflakeMainBatch Running');
+        
+        Integer partitionNumber = scope[0];
+        try {
+            // Make callout to fetch partition data
+            HttpResponse response2 = SnowflakeIntegration.fetchPartitionData(partitionNumber, statementHandle);
+			//System.debug('fetchPartitionData Status Code -'+response2.getStatusCode());
+            if (response2.getStatusCode() == 200) {
+                Map<String, Object> partitionDataMap = (Map<String, Object>) JSON.deserializeUntyped(response2.getBody());
+                
+                if (partitionDataMap.containsKey('data')) {
+                    List<Object> dataList = (List<Object>) partitionDataMap.get('data');
+                    System.debug(procedureName+' , Partition number - ' + partitionNumber + ', dataList size--' + dataList.size());
+                    
+                    // Process this partition's data through queueable
+					System.enqueueJob(new SnowflakePartitionDataQueueable(dataList, this.columnNames, null, String.valueOf(partitionNumber), this.procedureName));
+                }
+            } else {
+                System.debug(LoggingLevel.ERROR, 'Failed to fetch parent company partition ' + partitionNumber + 
+                            ': Status ' + response2.getStatusCode());
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Error processing parent company partition ' + partitionNumber +
+                        ': ' + e.getMessage() + ' - Stack: ' + e.getStackTraceString());
+        }
+    }
+
+    public void finish(Database.BatchableContext bc) {
+        System.debug('Finish Method of SnowflakeMainBatch');
+        // Guard clause to avoid null pointer
+        if (this.allPartitions == null || this.currentPartitionIndex == null) {
+            System.debug('No partitions available for chaining.');
+            return;
+        }
+        // Chain to next partition if there are more to process
+        this.currentPartitionIndex++;
+        if (this.currentPartitionIndex < this.allPartitions.size()) {
+            System.debug('Enqueuing next parent company partition: ' + this.currentPartitionIndex);
+            Database.executeBatch(new SnowflakeMainBatch(
+                this.startDate,
+                this.endDate,
+                this.statementHandle,
+                this.columnNames,
+                this.partitionCount,
+                this.allPartitions,
+                this.currentPartitionIndex,
+				this.procedureName
+            ), 1); // Batch size of 1 to process one partition at a time
+        } else {
+            System.debug('Snowflake '+this.procedureName+' Integration Completed - All partitions processed');
+        }
+    }
+}

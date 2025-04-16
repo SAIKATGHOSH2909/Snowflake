@@ -1,0 +1,66 @@
+/**
+ * AccountRelationshipBatchScheduler
+ * 
+ * This class reads relationship batch configurations from custom metadata
+ * and executes the relationship batches in the specified order.
+ */
+global class AccountRelationshipBatchScheduler implements Schedulable {
+    
+    /**
+     * Execute method that runs when the scheduler is triggered
+     */
+    global void execute(SchedulableContext sc) {
+        runNow();
+    }
+    
+    /**
+     * Method to run only the relationship batches
+     */
+    public static void runRelationshipBatches() {
+        // Get relationship batch configurations (execution order 5 and above)
+        List<Snowflake_Batch_Configuration__mdt> batchConfigs = [
+            SELECT Label, Batch_Input__c, Batch_Size__c, Execution_Order__c, 
+                   Is_Active__c, Start_Date_Override__c, End_Date_Override__c
+            FROM Snowflake_Batch_Configuration__mdt
+            WHERE Is_Active__c = true
+            AND Execution_Order__c!= null
+            AND Execution_Order__c >= 5  // Only get relationship batches (order 5 and above)
+            ORDER BY Execution_Order__c ASC
+        ];
+        
+        System.debug('Found ' + batchConfigs.size() + ' active relationship batch configurations');
+        
+        // Process each batch configuration
+        for (Snowflake_Batch_Configuration__mdt config : batchConfigs) {
+            try {
+                
+                // Determine batch size (default to 2000 if not specified)
+                Integer batchSize = config.Batch_Size__c != null ? Integer.valueOf(config.Batch_Size__c) : 2000;
+                
+                // Execute the appropriate batch based on the label
+                ID batchId;
+                
+                if (config.Label == 'DENTIST_PRACTICE_JUNCTION') {
+                    System.debug('Executing DentistPracticeJunctionBatch with batch size: ' + batchSize);
+                    batchId = Database.executeBatch(new DentistPracticeJunctionBatch(), batchSize);
+                } else {
+                    // For DENTIST_TO_PARENT and SUBSIDIARY_TO_DSO
+                    System.debug('Executing FlexibleAccountRelationshipBatch for: ' + config.Batch_Input__c + ' with batch size: ' + batchSize);
+                    batchId = Database.executeBatch(new FlexibleAccountRelationshipBatch(config.Batch_Input__c), batchSize);
+                }
+                
+                System.debug('Batch execution ID: ' + batchId);
+                
+            } catch (Exception e) {
+                System.debug('Error executing batch ' + config.Label + ': ' + e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Method to run the batch jobs immediately
+     */
+    public static void runNow() {
+        runRelationshipBatches();
+    }
+}

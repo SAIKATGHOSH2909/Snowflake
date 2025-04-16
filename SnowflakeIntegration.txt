@@ -1,0 +1,150 @@
+/**
+ * @File Name : SnowflakeIntegration.cls
+ * @Description : Optimized and bulkified class for Snowflake integration
+ * @Author : Salesforce Team
+ * @Last Modified On : April 7, 2025
+ */
+public with sharing class SnowflakeIntegration {
+
+    // Constants
+    private static final String SNOWFLAKE_NAMED_CREDENTIAL = 'Snowflake_Named_Credential';
+    private static final String SNOWFLAKE_API_PATH = '/api/v2/statements';
+    private static final String SNOWFLAKE_PARAM_STATEMENT = 'call edw_prod.sd.get_master_dentist_data';
+    private static final String SNOWFLAKE_DEFAULT_TIMEOUT = '600';
+    private static final String SNOWFLAKE_DEFAULT_DATABASE = 'edw_prod';
+    private static final String SNOWFLAKE_DEFAULT_SCHEMA = 'sd';
+    private static final String SNOWFLAKE_DEFAULT_WAREHOUSE = 'ETL';
+    public static final String BASE_URL = 'callout:' + SNOWFLAKE_NAMED_CREDENTIAL + SNOWFLAKE_API_PATH + '/';
+
+    /**
+    * Makes HTTP callout to Snowflake API with date range parameters
+    * @param procedureName The name of the Snowflake stored procedure to call
+    * @param startDate The start date parameter for the Snowflake stored procedure
+    * @param endDate The end date parameter for the Snowflake stored procedure
+    * @return HttpResponse The HTTP response from Snowflake
+    * @throws SnowflakeIntegrationException if the callout fails
+    */
+    public static HttpResponse callSnowflakeAPIWithDateRange(String procedureName, String startDate, String endDate) {
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint('callout:' + SNOWFLAKE_NAMED_CREDENTIAL + SNOWFLAKE_API_PATH);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            
+            Map<String, String> requestBody = new Map<String, String>{
+                'statement' => 'CALL EDW_PROD.SD.' + procedureName + '(\'' + 
+                            String.escapeSingleQuotes(startDate) + '\',\'' + 
+                            String.escapeSingleQuotes(endDate) + '\')',
+                'timeout' => SNOWFLAKE_DEFAULT_TIMEOUT,
+                'database' => SNOWFLAKE_DEFAULT_DATABASE,
+                'schema' => SNOWFLAKE_DEFAULT_SCHEMA,
+                'warehouse' => SNOWFLAKE_DEFAULT_WAREHOUSE
+            };
+            
+            req.setBody(JSON.serialize(requestBody));
+            //System.debug(LoggingLevel.INFO, 'Calling Snowflake procedure ' + procedureName + ' with date range: ' + startDate + ' to ' + endDate);
+            
+            return new Http().send(req);
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Snowflake API date range callout failed for procedure ' + procedureName + ': ' + e.getMessage() + '\n' + e.getStackTraceString());
+            throw new SnowflakeIntegrationException('Snowflake API date range callout failed for procedure ' + procedureName + ': ' + e.getMessage());
+        }
+    }
+
+    /**
+     * Extracts column names from resultSetMetaData
+     * @param metaData The metadata object from Snowflake response
+     * @return List<String> List of column names
+     * @throws SnowflakeIntegrationException if extraction fails
+     */
+    public static List<String> extractColumnNames(Map<String, Object> metaData) {
+        List<String> columnNameList = new List<String>();
+        try {
+            if (metaData == null) {
+                throw new SnowflakeIntegrationException('Metadata is null');
+            }
+            List<Object> rowTypes = (List<Object>) metaData.get('rowType');
+            if (rowTypes != null && !rowTypes.isEmpty()) {
+                for (Object rt : rowTypes) {
+                    Map<String, Object> rowType = (Map<String, Object>) rt;
+                    String columnName = (String) rowType.get('name');
+                    if (String.isNotBlank(columnName)) {
+                        columnNameList.add(columnName);
+                    }
+                }
+            } else {
+                throw new SnowflakeIntegrationException('No row types found in metadata');
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Failed to extract column names: ' + e.getMessage() + '\n' + e.getStackTraceString());
+            throw new SnowflakeIntegrationException('Error extracting column names from metadata: ' + e.getMessage());
+        }
+        
+        if (columnNameList.isEmpty()) {
+            throw new SnowflakeIntegrationException('No column names extracted from metadata');
+        }
+        
+        return columnNameList;
+    }
+
+    /**
+     * Fetches data for a specific partition
+     * @param partitionNumber The partition number to fetch
+     * @param statementHandle The statement handle from the initial response
+     * @return HttpResponse The HTTP response containing partition data
+     */
+    public static HttpResponse fetchPartitionData(Integer partitionNumber, String statementHandle){
+        if (String.isBlank(statementHandle)) {
+            throw new SnowflakeIntegrationException('Statement handle cannot be blank');
+        }
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(BASE_URL + statementHandle + '?partition=' + partitionNumber);
+            req.setMethod('GET');        
+            System.debug(LoggingLevel.INFO, 'Fetching partition ' + partitionNumber + ' for statement ' + statementHandle);
+            return new Http().send(req);
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Failed to fetch partition data: ' + e.getMessage() + '\n' + e.getStackTraceString());
+            throw new SnowflakeIntegrationException('Failed to fetch partition data: ' + e.getMessage());
+        }
+    }
+
+    /**
+    * Processes a chunk of data from Snowflake based on the procedure name
+    * @param dataChunk List of data rows to process
+    * @param columnNames List of column names corresponding to the data positions
+    * @param partitionInfo Information about the current partition for logging
+    * @param procedureName The name of the Snowflake stored procedure that was called
+    */
+    public static void processDataChunk(List<Object> dataChunk, List<String> columnNames, String partitionInfo,String procedureName) {
+        if (dataChunk == null || dataChunk.isEmpty() || columnNames == null || columnNames.isEmpty()) {
+            System.debug(LoggingLevel.WARN, 'Empty data chunk or column names received for partition: ' + partitionInfo);
+            return;
+        }
+        
+        try {
+            string acctype;
+            // Determine type of processing based on procedure name
+            if (procedureName == 'GET_PRACTICE_LOCATION_PARENT_COMPANY') {
+                acctype ='DSO';
+            } else if (procedureName == 'GET_PRACTICE_LOCATION_SUBSIDIARY') {
+                acctype ='Subsidiary';
+            } else if (procedureName == 'GET_PRACTICE_LOCATION') {
+                acctype = 'DentistPractice';
+            } else if (procedureName == 'GET_MASTER_DENTIST_DATA') {
+                acctype ='Dentist';
+            } else {
+                System.debug(LoggingLevel.WARN, 'Unknown procedure name: ' + procedureName + '. No processing performed.');
+            }
+            SnowflakeIntegrationUtility.processGenericAccountData(dataChunk, columnNames, partitionInfo, acctype);
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Error processing data chunk for procedure ' + procedureName + ' in partition ' + partitionInfo + ': ' + e.getMessage() + '\n' + e.getStackTraceString());
+            throw new SnowflakeIntegrationException('Error processing data chunk: ' + e.getMessage());
+        }
+    }
+
+    /**
+     * Custom exception class for Snowflake integration errors
+     */
+    public class SnowflakeIntegrationException extends Exception {}
+}

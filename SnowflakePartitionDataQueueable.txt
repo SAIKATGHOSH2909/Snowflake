@@ -1,0 +1,81 @@
+/**
+* @File Name : SnowflakePartitionDataQueueable.cls
+* @Description :
+* @Last Modified On : April 7, 2025
+* @Modification Log :
+*==============================================================================
+* Ver | Date | Author | Modification
+*==============================================================================
+* 1.0 | April 2, 2025 |   | Initial Version
+**/
+
+public class SnowflakePartitionDataQueueable implements Queueable {
+    
+        private static Boolean hasJobBeenEnqueued = false;
+        private List<String> columnNames;
+        private List<Object> dataList; 
+        private List<Object> remainingData;
+        private static final Integer chunkSize = (Integer)Snowflake_Batch_Configuration__mdt.getInstance('SnowflakePartitionDataQueueable').Batch_Size__c;
+        private String partitionNumber;
+        private String procedureName;
+    
+        public SnowflakePartitionDataQueueable(List<Object> dataList, List<String> columnNames, List<Object> remainingData,String partitionNumber,String procedureName) {
+            this.dataList = dataList;
+            this.columnNames = columnNames;
+            this.remainingData = remainingData;
+            this.partitionNumber = partitionNumber;
+            this.procedureName = procedureName;
+        }
+    
+        public void execute(QueueableContext context) {
+            try{
+                if (!hasJobBeenEnqueued) {
+                    hasJobBeenEnqueued = true;
+                    System.debug('Executing logic in the queueable class.');
+        
+                    if (dataList != null && !dataList.isEmpty()) {
+                        if (dataList.size() <= chunkSize) {
+                            SnowflakeIntegration.processDataChunk(dataList,this.columnNames,this.partitionNumber,this.procedureName);
+                        } else {
+                            List<Object> firstChunk = new List<Object>();
+                            for (Integer i = 0; i < chunkSize; i++) {
+                                firstChunk.add(dataList[i]);
+                            }
+        
+                            remainingData = new List<Object>();
+                            for (Integer i = chunkSize; i < dataList.size(); i++) {
+                                remainingData.add(dataList[i]);
+                            }
+        
+                            SnowflakeIntegration.processDataChunk(firstChunk,this.columnNames,this.partitionNumber,this.procedureName);
+                        }
+                    }
+        
+                    if (remainingData != null && !remainingData.isEmpty()) {
+                        List<Object> nextChunk = new List<Object>();
+                        
+                        Integer remainingSize = remainingData.size();
+        
+                        for (Integer i = 0; i < Math.min(chunkSize, remainingSize); i++) {
+                            nextChunk.add(remainingData[i]);
+                        }
+        
+                        List<Object> newRemainingData = new List<Object>();
+                        for (Integer i = chunkSize; i < remainingSize; i++) {
+                            newRemainingData.add(remainingData[i]);
+                        }
+        
+                        System.debug('Enqueuing another job with remaining data...');
+                        System.enqueueJob(new SnowflakePartitionDataQueueable(nextChunk, this.columnNames, newRemainingData,this.partitionNumber,this.procedureName));
+                    } else {
+                        System.debug('No remaining data to enqueue.');
+                    }
+        
+                } else {
+                    System.debug('Job has already been enqueued, no further jobs will be enqueued.');
+                }
+            }catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'Error processing partition data from Queueable - ' + e.getMessage()+e.getStackTraceString());
+            }
+        }
+    }

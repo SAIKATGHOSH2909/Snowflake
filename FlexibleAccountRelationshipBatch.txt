@@ -1,0 +1,332 @@
+/**
+ * @description Enhanced batch class to update Account Parent relationships for multiple scenarios
+ * @author Claude
+ * @date 2025-04-15
+ */
+public class FlexibleAccountRelationshipBatch implements Database.Batchable<SObject>, Database.Stateful {
+    
+    // Processing metrics
+    private Integer totalRecordsProcessed = 0;
+    private Integer successfulUpdates = 0;
+    private Integer failedUpdates = 0;
+    private List<String> errors = new List<String>();
+    
+    // Configuration variables
+    private String query;
+    private String parentLookupField;
+    private String targetRecordTypeName;
+    private String batchMode; // Added class variable for batchMode
+    
+    // Maps to store different types of parent records
+    private Map<String, Id> dsoParentMap = new Map<String, Id>();
+    private Map<String, Id> subsidiaryParentMap = new Map<String, Id>();
+    
+    // Sets to collect needed external IDs for parent records
+    private Set<String> neededDsoIds = new Set<String>();
+    private Set<String> neededSubsidiaryIds = new Set<String>();
+    
+    /**
+     * @description Constructor for specific batch modes
+     * @param batchMode The mode to operate in:
+     *        - SUBSIDIARY_TO_DSO: Update Subsidiary's ParentId to DSO
+     *        - DENTIST_TO_PARENT: Update DentistPractice's ParentId to Subsidiary or DSO
+     */
+    public FlexibleAccountRelationshipBatch(String batchMode) {
+        this.batchMode = batchMode; // Store batchMode in class variable
+        this.parentLookupField = 'ParentId';
+        
+        if (batchMode == 'DENTIST_TO_PARENT') {
+            // Configuration for DentistPractice parent relationship update
+            this.query = 'SELECT Id, ParentId, Subsidiary_Id__c, Parent_DSO_Id__c, Relationship_Established__c ' +
+                        'FROM Account ' +
+                        'WHERE (Parent_DSO_Id__c != null OR Subsidiary_Id__c != null) ' +
+                        'AND RecordType.DeveloperName = \'DentistPractice\' ' +
+                        'AND Relationship_Established__c = false';
+            this.targetRecordTypeName = 'DentistPractice';
+        } else if (batchMode == 'SUBSIDIARY_TO_DSO') {
+            // Configuration for Subsidiary-to-DSO relationship update
+            this.query = 'SELECT Id, ParentId, Parent_DSO_Id__c, Relationship_Established__c ' +
+                        'FROM Account ' +
+                        'WHERE Parent_DSO_Id__c != null ' +
+                        'AND RecordType.DeveloperName = \'Subsidiary\' ' +
+                        'AND Relationship_Established__c = false';
+            this.targetRecordTypeName = 'Subsidiary';
+        }
+        
+        // Collect needed external IDs first, then preload parent records
+        collectNeededExternalIds();
+        preloadParentRecords();
+    }
+    
+    /**
+     * @description Fully customizable constructor
+     * @param query The SOQL query to select records to process
+     * @param parentLookupField The lookup field to update
+     * @param targetRecordTypeName The record type of records to process
+     * @param batchMode The batch operation mode
+     */
+    public FlexibleAccountRelationshipBatch(String query, String parentLookupField,String targetRecordTypeName, String batchMode) {
+        this.query = query;
+        this.parentLookupField = parentLookupField;
+        this.targetRecordTypeName = targetRecordTypeName;
+        this.batchMode = batchMode;
+        
+        // Collect needed external IDs first, then preload parent records
+        collectNeededExternalIds();
+        preloadParentRecords();
+    }
+    
+    /**
+     * @description Collects all external IDs needed for parent record lookup
+     */
+    private void collectNeededExternalIds() {
+        try {
+            // Modify the query to only select the external ID fields we need
+            String externalIdQuery;
+            
+            if (batchMode == 'SUBSIDIARY_TO_DSO') {
+                externalIdQuery = this.query;
+                
+                for (Account acc : Database.query(externalIdQuery)) {
+                    if (String.isNotBlank(acc.Parent_DSO_Id__c)) {
+                        neededDsoIds.add(acc.Parent_DSO_Id__c);
+                    }
+                }
+            } 
+            else if (batchMode == 'DENTIST_TO_PARENT') {
+                externalIdQuery = this.query;
+                
+                for (Account acc : Database.query(externalIdQuery)) {
+                    if (String.isNotBlank(acc.Parent_DSO_Id__c)) {
+                        neededDsoIds.add(acc.Parent_DSO_Id__c);
+                    }
+                    if (String.isNotBlank(acc.Subsidiary_Id__c)) {
+                        neededSubsidiaryIds.add(acc.Subsidiary_Id__c);
+                    }
+                }
+            }
+            
+            System.debug(LoggingLevel.INFO, 'Collected ' + neededDsoIds.size() + ' unique DSO external IDs');
+            System.debug(LoggingLevel.INFO, 'Collected ' + neededSubsidiaryIds.size() + ' unique Subsidiary external IDs');
+            
+        } catch (Exception e) {
+            String errorMsg = 'Error collecting external IDs: ' + e.getMessage();
+            System.debug(LoggingLevel.ERROR, errorMsg);
+            errors.add(errorMsg);
+        }
+    }
+    
+    /**
+     * @description Preloads all potential parent records into memory based on batch mode
+     */
+    private void preloadParentRecords() {
+        try {
+            // Load DSO parent records (needed for both modes)
+            if (!neededDsoIds.isEmpty()) {
+                loadDsoParentRecords();
+            }
+            
+            // For DentistPractice mode, also load Subsidiary parent records
+            if (batchMode == 'DENTIST_TO_PARENT' && !neededSubsidiaryIds.isEmpty()) {
+                loadSubsidiaryParentRecords();
+            }
+            
+        } catch (Exception e) {
+            String errorMsg = 'Error preloading parent records: ' + e.getMessage();
+            System.debug(LoggingLevel.ERROR, errorMsg);
+            errors.add(errorMsg);
+        }
+    }
+    
+    /**
+     * @description Loads DSO parent records into memory based on needed external IDs
+     */
+    private void loadDsoParentRecords() {
+        // Only query for DSOs with external IDs that we actually need
+        String dsoQuery = 'SELECT Id, Snowflake_External_Id__c ' + 
+                       'FROM Account ' + 
+                       'WHERE RecordType.DeveloperName = \'DSO\' ' +
+                       'AND Snowflake_External_Id__c IN :neededDsoIds';
+        
+        for (Account dsoRecord : Database.query(dsoQuery)) {
+            String externalId = dsoRecord.Snowflake_External_Id__c;
+            if (String.isNotBlank(externalId)) {
+                dsoParentMap.put(externalId, dsoRecord.Id);
+            }
+        }
+        
+        System.debug(LoggingLevel.INFO, 'Preloaded ' + dsoParentMap.size() + ' out of ' + 
+                    neededDsoIds.size() + ' required DSO parent records');
+    }
+    
+    /**
+     * @description Loads Subsidiary parent records into memory based on needed external IDs
+     */
+    private void loadSubsidiaryParentRecords() {
+        // Only query for Subsidiaries with external IDs that we actually need
+        String subsidiaryQuery = 'SELECT Id, Snowflake_External_Id__c ' + 
+                              'FROM Account ' + 
+                              'WHERE RecordType.DeveloperName = \'Subsidiary\' ' +
+                              'AND Snowflake_External_Id__c IN :neededSubsidiaryIds';
+        
+        for (Account subsidiaryRecord : Database.query(subsidiaryQuery)) {
+            String externalId = subsidiaryRecord.Snowflake_External_Id__c;
+            if (String.isNotBlank(externalId)) {
+                subsidiaryParentMap.put(externalId, subsidiaryRecord.Id);
+            }
+        }
+        
+        System.debug(LoggingLevel.INFO, 'Preloaded ' + subsidiaryParentMap.size() + ' out of ' + 
+                    neededSubsidiaryIds.size() + ' required Subsidiary parent records');
+    }
+    
+    /**
+     * @description Batch start method - Returns the query locator for the batch
+     * @param bc The batch context
+     * @return Query locator for the batch
+     */
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        try {
+            System.debug(LoggingLevel.INFO, 'Starting batch processing with mode: ' + this.batchMode);
+            return Database.getQueryLocator(query);
+        } catch (Exception e) {
+            String errorMsg = 'Error in start method: ' + e.getMessage();
+            System.debug(LoggingLevel.ERROR, errorMsg);
+            errors.add(errorMsg);
+            // Return empty query locator to prevent errors
+            return Database.getQueryLocator('SELECT Id FROM Account WHERE Id = null');
+        }
+    }
+    
+    /**
+     * @description Batch execute method - Processes each batch of records
+     * @param bc The batch context
+     * @param scope The records to process in this chunk
+     */
+    public void execute(Database.BatchableContext bc, List<SObject> scope) {
+        System.debug(LoggingLevel.INFO, 'Execute Method - Mode: ' + this.batchMode);
+        List<Account> recordsToUpdate = new List<Account>();
+        
+        for (SObject record : scope) {
+            Account acc = (Account)record;
+            Id currentParentId = acc.ParentId;
+            Boolean isRelationshipEstablished = acc.Relationship_Established__c;
+            Id correctParentId = findCorrectParentId(acc);
+            
+            // Update if needed:
+            // 1. Parent needs changing (new parent ID found and it's different from current)
+            // 2. OR Parent is correct but relationship flag needs updating
+            if (correctParentId != null && 
+                ((currentParentId != correctParentId) || (currentParentId == correctParentId && isRelationshipEstablished == false))
+                ) {
+                
+                Account updateAccount = new Account(Id = acc.Id);
+                
+                // Only update ParentId if needed
+                if (currentParentId != correctParentId) {
+                    updateAccount.ParentId = correctParentId;
+                }
+                
+                // Always update the relationship flag
+                updateAccount.Relationship_Established__c = true;
+                recordsToUpdate.add(updateAccount);
+            }
+        }
+        
+        System.debug(LoggingLevel.INFO, 'Records to update: ' + recordsToUpdate.size());
+        
+        // Update records if any found
+        if (!recordsToUpdate.isEmpty()) {
+            totalRecordsProcessed += recordsToUpdate.size();
+            updateRecords(recordsToUpdate);
+        }
+    }
+    
+    /**
+     * @description Finds the correct parent ID based on batch mode
+     * @param record The account record to find parent for
+     * @return The correct parent ID or null if not found
+     */
+    private Id findCorrectParentId(Account record) {
+        if (this.batchMode == 'SUBSIDIARY_TO_DSO') {
+            // For Subsidiary accounts, look up DSO parent
+            String dsoIdValue = record.Parent_DSO_Id__c;
+            return (String.isNotBlank(dsoIdValue)) ? dsoParentMap.get(dsoIdValue) : null;
+        } 
+        else if (this.batchMode == 'DENTIST_TO_PARENT') {
+            // For DentistPractice accounts, try Subsidiary first, then DSO
+            String subsidiaryIdValue = record.Subsidiary_Id__c;
+            String dsoIdValue = record.Parent_DSO_Id__c;
+            
+            // Priority: Subsidiary first, then DSO
+            if (String.isNotBlank(subsidiaryIdValue) && subsidiaryParentMap.containsKey(subsidiaryIdValue)) {
+                return subsidiaryParentMap.get(subsidiaryIdValue);
+            } 
+            else if (String.isNotBlank(dsoIdValue) && dsoParentMap.containsKey(dsoIdValue)) {
+                return dsoParentMap.get(dsoIdValue);
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * @description Updates records and handles errors
+     * @param recordsToUpdate List of records to update
+     */
+    private void updateRecords(List<Account> recordsToUpdate) {
+        List<Database.SaveResult> results = Database.update(recordsToUpdate, false);
+        List<Error_Log__c> errorLogs = new List<Error_Log__c>();
+        
+        // Process results
+        for (Integer i = 0; i < results.size(); i++) {
+            Database.SaveResult result = results[i];
+            
+            if (result.isSuccess()) {
+                successfulUpdates++;
+            } else {
+                failedUpdates++;
+                
+                // Create error logs
+                String recordId = recordsToUpdate[i].Id;
+                for (Database.Error err : result.getErrors()) {
+                    Error_Log__c log = new Error_Log__c(
+                        Operation__c = this.parentLookupField + ' Update in ' + this.targetRecordTypeName + ' Account',
+                        Record_Id__c = recordId,
+                        Message__c = err.getMessage(),
+                        Error_Code__c = String.valueOf(err.getStatusCode()),
+                        Stack_Trace__c = String.join(err.getFields(), ', ')
+                    );
+                    errorLogs.add(log);
+                }
+            }
+        }
+        
+        // Insert error logs if any
+        if (!errorLogs.isEmpty()) {
+            try {
+                insert errorLogs;
+            } catch (Exception e) {
+                System.debug(LoggingLevel.ERROR, 'Failed to insert error logs: ' + e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * @description Batch finish method - Reports final results
+     * @param bc The batch context
+     */
+    public void finish(Database.BatchableContext bc) {
+        // Log completion metrics
+        System.debug(LoggingLevel.INFO, 'FlexibleAccountRelationshipBatch completed with mode: ' + batchMode);
+        System.debug(LoggingLevel.INFO, 'Total records processed: ' + totalRecordsProcessed);
+        System.debug(LoggingLevel.INFO, 'Successful updates: ' + successfulUpdates);
+        System.debug(LoggingLevel.INFO, 'Failed updates: ' + failedUpdates);
+        
+        if (!errors.isEmpty()) {
+            System.debug(LoggingLevel.ERROR, 'Errors encountered:');
+            for (String error : errors) {
+                System.debug(LoggingLevel.ERROR, error);
+            }
+        }
+    }
+}
